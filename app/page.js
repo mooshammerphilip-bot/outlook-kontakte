@@ -7,7 +7,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false)
   const [progress, setProgress] = useState("")
   const [result, setResult] = useState(null)
-  const [maxMails, setMaxMails] = useState(5000)
+  const [maxMails, setMaxMails] = useState(500)
   const [error, setError] = useState("")
 
   async function handleExport() {
@@ -22,7 +22,7 @@ export default function Home() {
         const err = await res.json()
         throw new Error(err.error || "Export fehlgeschlagen")
       }
-      const count = res.headers.get("X-COÁGact-Count")
+            const count = res.headers.get("X-Contact-Count")
       const mails = res.headers.get("X-Mail-Count")
       setProgress("Erstelle Excel-Datei...")
       const blob = await res.blob()
