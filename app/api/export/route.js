@@ -3,11 +3,13 @@ import { authOptions } from "../auth/[...nextauth]/route"
 import { htmlToText, buildContacts } from "../../../lib/parser"
 import ExcelJS from "exceljs"
 
+export const maxDuration = 60
+
 const GRAPH = "https://graph.microsoft.com/v1.0"
 
-async function fetchMails(accessToken, maxMails = 5000) {
+async function fetchMails(accessToken, maxMails = 1000) {
   const headers = { Authorization: `Bearer ${accessToken}` }
-  let url = `${GRAPH}/me/mailFolders/inbox/messages?$top=100&$select=from,receivedDateTime,body&$orderby=receivedDateTime desc`
+  let url = `${GRAPH}/me/mailFolders/inbox/messages?$top=50&$select=from,receivedDateTime,uniqueBody&$orderby=receivedDateTime desc`
   const mailItems = []
 
   while (url && mailItems.length < maxMails) {
@@ -18,7 +20,7 @@ async function fetchMails(accessToken, maxMails = 5000) {
     for (const mail of data.value || []) {
       try {
         const sender = mail.from?.emailAddress || {}
-        const bodyObj = mail.body || {}
+        const bodyObj = mail.uniqueBody || {}
         const raw = bodyObj.content || ""
         const body = bodyObj.contentType === "html" ? htmlToText(raw) : raw
         mailItems.push({
@@ -31,7 +33,6 @@ async function fetchMails(accessToken, maxMails = 5000) {
     }
 
     url = data["@odata.nextLink"] || null
-    await new Promise(r => setTimeout(r, 30))
   }
 
   return mailItems
@@ -44,7 +45,7 @@ function createExcel(contacts) {
   const COLUMNS = [
     { header: "Vorname",            key: "vorname",   width: 15 },
     { header: "Nachname",           key: "nachname",  width: 20 },
-    { header: "Vollständiger Name", key: "name",      width: 28 },
+    { header: "Vollstaendiger Name", key: "name",      width: 28 },
     { header: "Firma",              key: "firma",     width: 30 },
     { header: "Position",           key: "position",  width: 32 },
     { header: "Email",              key: "email",     width: 32 },
@@ -98,7 +99,7 @@ export async function GET(request) {
   }
 
   const { searchParams } = new URL(request.url)
-  const maxMails = parseInt(searchParams.get("max") || "5000")
+  const maxMails = parseInt(searchParams.get("max") || "1000")
 
   try {
     const mailItems = await fetchMails(session.accessToken, maxMails)
