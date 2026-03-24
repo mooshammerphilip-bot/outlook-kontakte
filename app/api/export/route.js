@@ -7,45 +7,71 @@ export const maxDuration = 60
 
 const GRAPH = "https://graph.microsoft.com/v1.0"
 
-async function fetchMails(accessToken, maxMails = 1000) {
+async function fetchMails(accessToken, maxMails = 5000) {
   const headers = { Authorization: `Bearer ${accessToken}` }
-  let url = `${GRAPH}/me/mailFolders/inbox/messages?$top=50&$select=from,receivedDateTime,uniqueBody&$orderby=receivedDateTime desc`
-  const mailItems = []
 
-  while (url && mailItems.length < maxMails) {
+  // Step 1: Get sender list quickly (no body) - 100 per page
+  let url = `${GRAPH}/me/mailFolders/inbox/messages?$top=100&$select=from,receivedDateTime&$orderby=receivedDateTime desc`
+  const senderMap = new Map()
+  let total = 0
+
+  while (url && total < maxMails) {
     const res = await fetch(url, { headers })
     if (!res.ok) break
     const data = await res.json()
 
     for (const mail of data.value || []) {
-      try {
-        const sender = mail.from?.emailAddress || {}
-        const bodyObj = mail.uniqueBody || {}
-        const raw = bodyObj.content || ""
-        const body = bodyObj.contentType === "html" ? htmlToText(raw) : raw
-        mailItems.push({
-          email: (sender.address || "").toLowerCase().trim(),
-          name: sender.name || "",
-          body,
-          date: (mail.receivedDateTime || "").slice(0, 10),
-        })
-      } catch {}
+      const addr = (mail.from?.emailAddress?.address || "").toLowerCase().trim()
+      const name = mail.from?.emailAddress?.name || ""
+      const date = (mail.receivedDateTime || "").slice(0, 10)
+      if (!addr) continue
+      if (!senderMap.has(addr)) {
+        senderMap.set(addr, { name, date, id: mail.id })
+      }
+      total++
     }
 
     url = data["@odata.nextLink"] || null
   }
 
-  return mailItems
+  // Step 2: Fetch body only for unique senders (max 200 to stay within timeout)
+  const senders = [...senderMap.entries()]
+  const toFetch = senders.slice(0, 200)
+
+  const mailItems = await Promise.all(
+    toFetch.map(async ([email, info]) => {
+      try {
+        const res = await fetch(
+          `${GRAPH}/me/messages/${info.id}?$select=uniqueBody`,
+          { headers }
+        )
+        if (!res.ok) return { email, name: info.name, body: "", date: info.date }
+        const data = await res.json()
+        const raw = data.uniqueBody?.content || ""
+        const body = data.uniqueBody?.contentType === "html" ? htmlToText(raw) : raw
+        return { email, name: info.name, body, date: info.date }
+      } catch {
+        return { email, name: info.name, body: "", date: info.date }
+      }
+    })
+  )
+
+  // Add remaining senders without body
+  for (const [email, info] of senders.slice(200)) {
+    mailItems.push({ email, name: info.name, body: "", date: info.date })
+  }
+
+  return { mailItems, totalScanned: total }
 }
 
 function createExcel(contacts) {
   const wb = new ExcelJS.Workbook()
   const ws = wb.addWorksheet("Kontakte")
 
-  const COLUMNS = [
+  ws.columns = [
     { header: "Vorname",            key: "vorname",   width: 15 },
     { header: "Nachname",           key: "nachname",  width: 20 },
-    { header: "Vollstaendiger Name", key: "name",      width: 28 },
+    { header: "Vollst Name",        key: "name",      width: 28 },
     { header: "Firma",              key: "firma",     width: 30 },
     { header: "Position",           key: "position",  width: 32 },
     { header: "Email",              key: "email",     width: 32 },
@@ -54,12 +80,10 @@ function createExcel(contacts) {
     { header: "Letzte E-Mail",      key: "date",      width: 16 },
   ]
 
-  ws.columns = COLUMNS
-
   ws.getRow(1).eachCell(cell => {
     cell.font = { name: "Arial", bold: true, color: { argb: "FFFFFFFF" }, size: 10 }
     cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F4E79" } }
-    cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true }
+    cell.alignment = { horizontal: "center", vertical: "middle" }
     cell.border = {
       top: { style: "thin", color: { argb: "FFB0B0B0" } },
       bottom: { style: "thin", color: { argb: "FFB0B0B0" } },
@@ -99,13 +123,12 @@ export async function GET(request) {
   }
 
   const { searchParams } = new URL(request.url)
-  const maxMails = parseInt(searchParams.get("max") || "1000")
+  const maxMails = parseInt(searchParams.get("max") || "5000")
 
   try {
-    const mailItems = await fetchMails(session.accessToken, maxMails)
+    const { mailItems, totalScanned } = await fetchMails(session.accessToken, maxMails)
     const contacts = buildContacts(mailItems)
     const wb = createExcel(contacts)
-
     const buffer = await wb.xlsx.writeBuffer()
 
     return new Response(buffer, {
@@ -114,7 +137,7 @@ export async function GET(request) {
         "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "Content-Disposition": `attachment; filename="outlook_kontakte.xlsx"`,
         "X-Contact-Count": String(contacts.length),
-        "X-Mail-Count": String(mailItems.length),
+        "X-Mail-Count": String(totalScanned),
       },
     })
   } catch (err) {
