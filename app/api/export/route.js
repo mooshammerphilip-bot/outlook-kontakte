@@ -6,7 +6,6 @@ import ExcelJS from "exceljs"
 export const maxDuration = 60
 
 const GRAPH = "https://graph.microsoft.com/v1.0"
-const OPENAI_API = "https://api.openai.com/v1/chat/completions"
 
 async function fetchAllSenders(accessToken, maxMails) {
   const headers = { Authorization: `Bearer ${accessToken}` }
@@ -51,57 +50,93 @@ async function fetchBodies(accessToken, senders) {
   return mailItems
 }
 
-function extractSig(body) {
-  // Give GPT the full mail body (last 60 lines, stripped of noise)
-  // Position can be anywhere: above/below signature, after greeting, etc.
-  const lines = body.split("\n")
-    .map(l => l.trim())
-    .filter(l => l.length > 0 && l.length < 200)
-    .filter(l => !/^(https?:\/\/|www\.|ARC-|DKIM-|Content-|Received:|Message-ID|X-MS|Thread-|Return-Path)/i.test(l))
-  return lines.slice(-60).join("\n")
-}
-
-async function gptEnrich(contacts) {
-  if (!process.env.OPENAI_API_KEY) return contacts
-  const toEnrich = contacts.filter(c => c._sig && c._sig.length > 10)
-  if (!toEnrich.length) return contacts
-
-  const BATCH = 40
-  for (let i = 0; i < toEnrich.length; i += BATCH) {
-    const batch = toEnrich.slice(i, i + BATCH)
-    const prompt = `Du bekommst E-Mail-Inhalte von Kontakten. Extrahiere Jobtitel/Position und Firmenname.
-Antworte NUR mit einem JSON-Array, kein anderer Text:
-[{"id":0,"position":"Assistenz der Geschaeftsfuehrung","firma":"Feser Graf GmbH"},{"id":1,"position":"","firma":""}]
-
-Regeln:
-- position = Berufsbezeichnung/Jobtitel (ALLE Berufe, auch einfache wie Sachbearbeiter, Assistent, Techniker etc.)
-- Position steht oft direkt unter dem Namen, nach Grussformel, oder in der Signatur
-- firma = vollstaendiger offizieller Firmenname
-- Leerer String wenn nicht erkennbar
-
-${batch.map((c, idx) => `[ID:${idx}] Name: ${c.name}\n${c._sig}`).join("\n===\n")}`
-
-    try {
-      const res = await fetch(OPENAI_API, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.OPENAI_API_KEY}` },
-        body: JSON.stringify({ model: "gpt-4o-mini", max_tokens: 2000, messages: [{ role: "user", content: prompt }] }),
-      })
-      if (!res.ok) continue
-      const data = await res.json()
-      const text = data.choices?.[0]?.message?.content || ""
-      const match = text.match(/\[[\s\S]*?\]/)
-      if (!match) continue
-      const results = JSON.parse(match[0])
-      for (const r of results) {
-        if (typeof r.id === 'number' && r.id >= 0 && r.id < batch.length) {
-          if (r.position) batch[r.id].position = r.position
-          if (r.firma && !batch[r.id].firma) batch[r.id].firma = r.firma
+// Find position and phone directly from mail body
+// Searches both near the sender name AND in the signature block
+function extractPositionAndPhone(body, senderName) {
+  const lines = body.split("\n").map(l => l.trim()).filter(l => l.length > 0 && l.length < 150)
+  
+  let position = ""
+  let phone = ""
+  let firma = ""
+  
+  const NOISE = /www\.|https?:\/\/|@|registergericht|steuer|iban|bic|datenschutz|disclaimer|confidential|unsubscribe|copyright|agb|fax:|\bfax\b/i
+  const PHONE_RE = /(?:(?:tel|fon|phone|mob|mobil|t|m|d|direct)[s:./\-]*)?(\ *\+?[0-9][0-9\s()\-\/\.]{5,18}[0-9])/i
+  const COMPANY_RE = /\b(GmbH|AG|KG|OG|GbR|Ltd\.?|Inc\.?|Corp\.?|SE\b|e\.U\.|KEG|GmbH\s*&\s*Co\.?\s*KG|Gruppe\b|Group\b|Holding\b|GesmbH|Automobil|Autohaus|Fahrzeug|Werkstatt)\b/i
+  
+  // Position patterns - covers all job types
+  const POS_RE = /\b(geschaeftsfuehrer|geschaeftsfuehrerin|geschaeftsfuehrungi?\.?a\.|i\s*\.?\s*a\.|geschaftsfuhrung|geschaftsleit|geschaftsleiter|inhaber|eigentuemer|owner|founder|ceo|cfo|cto|coo|cso|vorstand|direktor|director|prokurist|leiter|leiterin|head of|vp |vice pres|managing|partner|gesellschafter|verkauf|verkaeufer|verkaufsberater|vertrieb|account manager|sales|aussendienst|innendienst|kundenberater|berater|beraterin|consultant|advisor|marketing|pr-?manager|redakteur|content|techniker|ingenieur|engineer|entwickler|developer|programmierer|it-?leiter|administrator|personal|hr |recruiter|assistent|assistentin|assistant|office manager|sachbearbeiter|referent|sekretaer|projektleiter|projektmanager|koordinator|finanz|controller|serviceleiter|servicetechniker|werkstattleiter|after.?sales|kundendienst|support)\b/i
+  
+  // Strategy 1: Look for position NEAR the sender name in the mail
+  const nameParts = senderName.toLowerCase().split(/\s+/).filter(p => p.length > 2)
+  let nameLineIdx = -1
+  
+  for (let i = 0; i < lines.length; i++) {
+    const lineLow = lines[i].toLowerCase()
+    if (nameParts.length >= 2 && nameParts.every(p => lineLow.includes(p))) {
+      nameLineIdx = i
+      break
+    }
+    if (nameParts.length >= 1 && nameParts[0].length > 3 && lineLow.includes(nameParts[0]) && 
+        (nameParts.length === 1 || lineLow.includes(nameParts[nameParts.length-1]))) {
+      nameLineIdx = i
+      break
+    }
+  }
+  
+  // Check 5 lines after the name for position
+  if (nameLineIdx >= 0) {
+    for (let i = nameLineIdx + 1; i < Math.min(nameLineIdx + 6, lines.length); i++) {
+      const line = lines[i]
+      if (!line || NOISE.test(line)) continue
+      if (line.length > 80) continue
+      if (!position && POS_RE.test(line)) {
+        position = line
+      }
+      if (!firma && COMPANY_RE.test(line)) {
+        firma = line
+      }
+    }
+  }
+  
+  // Strategy 2: Find signature block and extract from there
+  let sigStart = -1
+  const GREETING_RE = /^(mit (freundlichen?|besten?|herzlichen?|lieben?|kollegialen?|vielen?)|with (kind|best|warm) regards|best regards|kind regards|viele gr|herzlich|freundlich|sincerely|mit gr|gruss|gruesse|^mfg|^vg\s*$|^lg[,.]?\s*$|^ciao\s*$)/i
+  
+  for (let i = lines.length - 1; i > Math.max(0, lines.length - 80); i--) {
+    if (GREETING_RE.test(lines[i]) || /^(_{2,}|-{2,})/.test(lines[i])) {
+      sigStart = i
+      break
+    }
+  }
+  
+  const sigLines = sigStart >= 0 ? lines.slice(sigStart) : lines.slice(-35)
+  
+  for (const line of sigLines) {
+    if (NOISE.test(line) || line.length > 120) continue
+    
+    // Extract phone
+    if (!phone) {
+      const m = PHONE_RE.exec(line)
+      if (m) {
+        const digits = m[1].replace(/\D/g, "")
+        if (digits.length >= 7 && digits.length <= 15 && !/^(19|20)\d{2}$/.test(digits)) {
+          phone = m[1].trim()
         }
       }
-    } catch (e) {}
+    }
+    
+    // Extract position from sig if not found near name
+    if (!position && POS_RE.test(line) && line.length < 80) {
+      position = line.replace(PHONE_RE, "").trim()
+    }
+    
+    // Extract firma from sig
+    if (!firma && COMPANY_RE.test(line) && line.length < 100) {
+      firma = line.replace(PHONE_RE, "").trim()
+    }
   }
-  return contacts
+  
+  return { position, phone, firma }
 }
 
 function createExcel(contacts) {
@@ -149,29 +184,32 @@ export async function GET(request) {
   const maxMails = parseInt(searchParams.get("max") || "5000")
 
   try {
-    // Step 1: Get all sender IDs fast
     const { senderMap, total } = await fetchAllSenders(session.accessToken, maxMails)
     const senders = [...senderMap.entries()]
-
-    // Step 2: Fetch bodies for all unique senders
     const mailItems = await fetchBodies(session.accessToken, senders)
-
-    // Step 3: Build contacts with regex parser
+    
+    // Build base contacts with parser (phone + basic firma)
     let contacts = buildContacts(mailItems)
-
-    // Step 4: Build signature map
-    const sigMap = new Map()
+    
+    // Build body map for enhanced extraction
+    const bodyMap = new Map()
     for (const item of mailItems) {
-      if (item.body && !sigMap.has(item.email)) {
-        sigMap.set(item.email, extractSig(item.body))
-      }
+      if (item.body && !bodyMap.has(item.email)) bodyMap.set(item.email, item.body)
     }
+    
+    // Enhance each contact with smart position/phone extraction
+    contacts = contacts.map(c => {
+      const body = bodyMap.get(c.email) || bodyMap.get(c.email2) || ""
+      if (!body) return c
+      const { position, phone, firma } = extractPositionAndPhone(body, c.name)
+      return {
+        ...c,
+        position: c.position || position,
+        telefon: c.telefon || phone,
+        firma: c.firma || firma,
+      }
+    })
 
-    // Step 5: Attach sigs and enrich with GPT in parallel
-    contacts = contacts.map(c => ({ ...c, _sig: sigMap.get(c.email) || "" }))
-    contacts = await gptEnrich(contacts)
-
-    // Clean output
     const out = contacts.map(c => ({
       vorname: c.vorname, nachname: c.nachname, name: c.name,
       firma: c.firma, position: c.position,
