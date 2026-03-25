@@ -63,49 +63,44 @@ function extractSig(body) {
 
 async function gptEnrich(contacts) {
   if (!process.env.OPENAI_API_KEY) return contacts
-  // Only contacts with a signature but missing position
   const toEnrich = contacts.filter(c => c._sig && c._sig.length > 10)
   if (!toEnrich.length) return contacts
 
-  const BATCH = 25
-  const calls = []
+  const BATCH = 40
   for (let i = 0; i < toEnrich.length; i += BATCH) {
-    calls.push(toEnrich.slice(i, i + BATCH))
-  }
+    const batch = toEnrich.slice(i, i + BATCH)
+    const prompt = `Du bekommst E-Mail-Inhalte von Kontakten. Extrahiere Jobtitel/Position und Firmenname.
+Antworte NUR mit einem JSON-Array, kein anderer Text:
+[{"id":0,"position":"Assistenz der Geschaeftsfuehrung","firma":"Feser Graf GmbH"},{"id":1,"position":"","firma":""}]
 
-  // Run all batches in parallel
-  await Promise.all(calls.map(async (batch) => {
-    const prompt = `Du bekommst E-Mail-Inhalte. Finde Position/Jobtitel und Firma.
-Antworte NUR mit JSON-Array:
-[{"id":0,"position":"Assistenz der Geschaeftsfuehrung","firma":"Feser Graf GmbH"}]
+Regeln:
+- position = Berufsbezeichnung/Jobtitel (ALLE Berufe, auch einfache wie Sachbearbeiter, Assistent, Techniker etc.)
+- Position steht oft direkt unter dem Namen, nach Grussformel, oder in der Signatur
+- firma = vollstaendiger offizieller Firmenname
+- Leerer String wenn nicht erkennbar
 
-Wichtig:
-- Position kann ueberall stehen: direkt unter dem Namen, in der Signatur, nach der Anrede
-- Erkenne ALLE Berufe (nicht nur Fuehrungskraefte)
-- Firma = vollstaendiger Firmenname falls erkennbar
-- Leer lassen wenn wirklich nichts erkennbar
+${batch.map((c, idx) => `[ID:${idx}] Name: ${c.name}\n${c._sig}`).join("\n===\n")}`
 
-${batch.map((c, i) => `[${i}] Name: ${c.name}\n${c._sig}`).join("\n---\n")}`
     try {
       const res = await fetch(OPENAI_API, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.OPENAI_API_KEY}` },
-        body: JSON.stringify({ model: "gpt-4o-mini", max_tokens: 1500, messages: [{ role: "user", content: prompt }] }),
+        body: JSON.stringify({ model: "gpt-4o-mini", max_tokens: 2000, messages: [{ role: "user", content: prompt }] }),
       })
-      if (!res.ok) return
+      if (!res.ok) continue
       const data = await res.json()
       const text = data.choices?.[0]?.message?.content || ""
-      const match = text.match(/\[[\s\S]*\]/)
-      if (!match) return
+      const match = text.match(/\[[\s\S]*?\]/)
+      if (!match) continue
       const results = JSON.parse(match[0])
       for (const r of results) {
-        if (r.id >= 0 && r.id < batch.length) {
-          if (r.position && !batch[r.id].position) batch[r.id].position = r.position
+        if (typeof r.id === 'number' && r.id >= 0 && r.id < batch.length) {
+          if (r.position) batch[r.id].position = r.position
           if (r.firma && !batch[r.id].firma) batch[r.id].firma = r.firma
         }
       }
-    } catch {}
-  }))
+    } catch (e) {}
+  }
   return contacts
 }
 
