@@ -10,7 +10,7 @@ const GRAPH = "https://graph.microsoft.com/v1.0"
 async function fetchMails(accessToken, maxMails = 5000) {
   const headers = { Authorization: `Bearer ${accessToken}` }
 
-  // Step 1: Get sender list quickly (no body) - 100 per page
+  // Step 1: Get all senders fast (no body), 100 per page
   let url = `${GRAPH}/me/mailFolders/inbox/messages?$top=100&$select=from,receivedDateTime&$orderby=receivedDateTime desc`
   const senderMap = new Map()
   let total = 0
@@ -19,7 +19,6 @@ async function fetchMails(accessToken, maxMails = 5000) {
     const res = await fetch(url, { headers })
     if (!res.ok) break
     const data = await res.json()
-
     for (const mail of data.value || []) {
       const addr = (mail.from?.emailAddress?.address || "").toLowerCase().trim()
       const name = mail.from?.emailAddress?.name || ""
@@ -30,35 +29,35 @@ async function fetchMails(accessToken, maxMails = 5000) {
       }
       total++
     }
-
     url = data["@odata.nextLink"] || null
   }
 
-  // Step 2: Fetch body only for unique senders (max 200 to stay within timeout)
   const senders = [...senderMap.entries()]
-  const toFetch = senders.slice(0, 200)
 
-  const mailItems = await Promise.all(
-    toFetch.map(async ([email, info]) => {
-      try {
-        const res = await fetch(
-          `${GRAPH}/me/messages/${info.id}?$select=uniqueBody`,
-          { headers }
-        )
-        if (!res.ok) return { email, name: info.name, body: "", date: info.date }
-        const data = await res.json()
-        const raw = data.uniqueBody?.content || ""
-        const body = data.uniqueBody?.contentType === "html" ? htmlToText(raw) : raw
-        return { email, name: info.name, body, date: info.date }
-      } catch {
-        return { email, name: info.name, body: "", date: info.date }
-      }
-    })
-  )
+  // Step 2: Fetch body for ALL unique senders in parallel batches of 20
+  const BATCH = 20
+  const mailItems = []
 
-  // Add remaining senders without body
-  for (const [email, info] of senders.slice(200)) {
-    mailItems.push({ email, name: info.name, body: "", date: info.date })
+  for (let i = 0; i < senders.length; i += BATCH) {
+    const batch = senders.slice(i, i + BATCH)
+    const results = await Promise.all(
+      batch.map(async ([email, info]) => {
+        try {
+          const res = await fetch(
+            `${GRAPH}/me/messages/${info.id}?$select=uniqueBody`,
+            { headers }
+          )
+          if (!res.ok) return { email, name: info.name, body: "", date: info.date }
+          const data = await res.json()
+          const raw = data.uniqueBody?.content || ""
+          const body = data.uniqueBody?.contentType === "html" ? htmlToText(raw) : raw
+          return { email, name: info.name, body, date: info.date }
+        } catch {
+          return { email, name: info.name, body: "", date: info.date }
+        }
+      })
+    )
+    mailItems.push(...results)
   }
 
   return { mailItems, totalScanned: total }
@@ -69,15 +68,15 @@ function createExcel(contacts) {
   const ws = wb.addWorksheet("Kontakte")
 
   ws.columns = [
-    { header: "Vorname",            key: "vorname",   width: 15 },
-    { header: "Nachname",           key: "nachname",  width: 20 },
-    { header: "Vollst Name",        key: "name",      width: 28 },
-    { header: "Firma",              key: "firma",     width: 30 },
-    { header: "Position",           key: "position",  width: 32 },
-    { header: "Email",              key: "email",     width: 32 },
-    { header: "Email 2",            key: "email2",    width: 28 },
-    { header: "Telefon",            key: "telefon",   width: 28 },
-    { header: "Letzte E-Mail",      key: "date",      width: 16 },
+    { header: "Vorname",       key: "vorname",   width: 15 },
+    { header: "NacName",      key: "nachname",  width: 20 },
+    { header: "Name",          key: "name",      width: 28 },
+    { header: "Firma",         key: "firma",     width: 30 },
+    { header: "Position",      key: "position",  width: 32 },
+    { header: "Email",         key: "email",     width: 32 },
+    { header: "Email 2",       key: "email2",    width: 28 },
+    { header: "Telefon",       key: "telefon",   width: 28 },
+    { header: "Letzte E-Mail", key: "date",      width: 16 },
   ]
 
   ws.getRow(1).eachCell(cell => {
@@ -95,8 +94,8 @@ function createExcel(contacts) {
   ws.views = [{ state: "frozen", ySplit: 1 }]
   ws.autoFilter = { from: "A1", to: "I1" }
 
-  contacts.forEach((contact, i) => {
-    const row = ws.addRow(contact)
+  contacts.forEach((c, i) => {
+    const row = ws.addRow(c)
     const fill = i % 2 === 0
       ? { type: "pattern", pattern: "solid", fgColor: { argb: "FFDCE6F1" } }
       : undefined
