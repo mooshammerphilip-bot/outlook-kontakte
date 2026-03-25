@@ -52,14 +52,13 @@ async function fetchBodies(accessToken, senders) {
 }
 
 function extractSig(body) {
+  // Give GPT the full mail body (last 60 lines, stripped of noise)
+  // Position can be anywhere: above/below signature, after greeting, etc.
   const lines = body.split("\n")
-  for (let i = lines.length - 1; i > Math.max(0, lines.length - 120); i--) {
-    const t = lines[i].trim()
-    if (/^(_{2,}|-{2,})|mit freundl|with kind|best regard|freundlich|viele gr|herzlich|kind regard|sincerely|^mfg\s*$|^lg[,.]?\s*$|^vg\s*$/i.test(t)) {
-      return lines.slice(i, i + 35).map(l => l.trim()).filter(l => l && l.length < 120).join("\n")
-    }
-  }
-  return lines.slice(-25).map(l => l.trim()).filter(l => l && l.length < 120).join("\n")
+    .map(l => l.trim())
+    .filter(l => l.length > 0 && l.length < 200)
+    .filter(l => !/^(https?:\/\/|www\.|ARC-|DKIM-|Content-|Received:|Message-ID|X-MS|Thread-|Return-Path)/i.test(l))
+  return lines.slice(-60).join("\n")
 }
 
 async function gptEnrich(contacts) {
@@ -76,11 +75,17 @@ async function gptEnrich(contacts) {
 
   // Run all batches in parallel
   await Promise.all(calls.map(async (batch) => {
-    const prompt = `E-Mail-Signaturen. Gib NUR JSON-Array zurueck:
-[{"id":0,"position":"Geschaeftsfuehrer","firma":"BMW GmbH"}]
-Regeln: position=Jobtitel (alle Berufe), firma=Firmenname, leer wenn unbekannt.
+    const prompt = `Du bekommst E-Mail-Inhalte. Finde Position/Jobtitel und Firma.
+Antworte NUR mit JSON-Array:
+[{"id":0,"position":"Assistenz der Geschaeftsfuehrung","firma":"Feser Graf GmbH"}]
 
-${batch.map((c, i) => `[${i}] ${c.name}\n${c._sig}`).join("\n---\n")}`
+Wichtig:
+- Position kann ueberall stehen: direkt unter dem Namen, in der Signatur, nach der Anrede
+- Erkenne ALLE Berufe (nicht nur Fuehrungskraefte)
+- Firma = vollstaendiger Firmenname falls erkennbar
+- Leer lassen wenn wirklich nichts erkennbar
+
+${batch.map((c, i) => `[${i}] Name: ${c.name}\n${c._sig}`).join("\n---\n")}`
     try {
       const res = await fetch(OPENAI_API, {
         method: "POST",
