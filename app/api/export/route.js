@@ -6,11 +6,10 @@ import ExcelJS from "exceljs"
 export const maxDuration = 60
 
 const GRAPH = "https://graph.microsoft.com/v1.0"
+const ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
 
 async function fetchMails(accessToken, maxMails = 5000) {
   const headers = { Authorization: `Bearer ${accessToken}` }
-
-  // Step 1: Get all senders fast (no body), 100 per page
   let url = `${GRAPH}/me/mailFolders/inbox/messages?$top=100&$select=from,receivedDateTime&$orderby=receivedDateTime desc`
   const senderMap = new Map()
   let total = 0
@@ -34,7 +33,7 @@ async function fetchMails(accessToken, maxMails = 5000) {
 
   const senders = [...senderMap.entries()]
 
-  // Step 2: Fetch body for ALL unique senders in parallel batches of 20
+  // Fetch body for all unique senders in batches of 20
   const BATCH = 20
   const mailItems = []
 
@@ -63,6 +62,82 @@ async function fetchMails(accessToken, maxMails = 5000) {
   return { mailItems, totalScanned: total }
 }
 
+// Extract signature lines from body text
+function extractSignatureLines(body) {
+  const lines = body.split("\n")
+  // Find signature separator
+  for (let i = lines.length - 1; i > Math.max(0, lines.length - 120); i--) {
+    const t = lines[i].trim()
+    if (/^(_{2,}|-{2,})|mit freundlichen|with kind regards|best regards|freundliche gr|freundlichen gr|viele gr|herzliche gr|kind regards|sincerely|^mfg\s*$|^lg[,.]?\s*$|^vg\s*$/i.test(t)) {
+      return lines.slice(i, i + 40).map(l => l.trim()).filter(l => l && l.length < 120).join("\n")
+    }
+  }
+  return lines.slice(-35).map(l => l.trim()).filter(l => l && l.length < 120).join("\n")
+}
+
+// Use Claude AI to extract position and company from signature
+async function extractWithAI(contacts) {
+  // Only call AI for contacts that have a body/signature
+  const needsAI = contacts.filter(c => c._sig && c._sig.length > 20)
+  if (needsAI.length === 0) return contacts
+
+  // Build batch prompt for all contacts at once (max 50 per call)
+  const AIBATCH = 50
+  for (let i = 0; i < needsAI.length; i += AIBATCH) {
+    const batch = needsAI.slice(i, i + AIBATCH)
+    const prompt = `Du bekommst E-Mail-Signaturen von Kontakten. Extrahiere fuer jeden Kontakt die Berufsposition und Firmenname.
+
+Antworte NUR mit einem JSON-Array in diesem Format (keine anderen Texte):
+[{"id":0,"position":"Verkaufsberater","firma":"BMW Group"},{"id":1,"position":"","firma":""}]
+
+Regeln:
+- "position" = Berufsbezeichnung/Jobtitel (z.B. "Geschaeftsfuehrer", "Verkaufsberater", "Marketing Manager", "Assistentin", "Techniker")
+- "firma" = Firmenname (nur wenn klar erkennbar, sonst leer)
+- Falls keine Position erkennbar: leerer String ""
+- Kuerze Positionen auf das Wesentliche
+- Erkenne alle Berufe, nicht nur Fuehrungskraevfte
+
+Signaturen:
+${batch.map((c, idx) => `[${idx}] Name: ${c.name}\n${c._sig}`).join("\n\n---\n\n")}
+`
+
+    try {
+      const res = await fetch(ANTHROPIC_API, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.ANTHROPIC_API_KEY || "",
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 2000,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      })
+
+      if (!res.ok) continue
+      const data = await res.json()
+      const text = data.content?.[0]?.text || ""
+      const jsonMatch = text.match(/\[[\s\S]*\]/)
+      if (!jsonMatch) continue
+
+      const results = JSON.parse(jsonMatch[0])
+      for (const r of results) {
+        if (r.id >= 0 && r.id < batch.length) {
+          const contact = batch[r.id]
+          if (r.position && !contact.position) contact.position = r.position
+          if (r.firma && !contact.firma) contact.firma = r.firma
+        }
+      }
+    } catch {
+      // Continue without AI for this batch
+    }
+  }
+
+  return contacts
+}
+
 function createExcel(contacts) {
   const wb = new ExcelJS.Workbook()
   const ws = wb.addWorksheet("Kontakte")
@@ -71,12 +146,12 @@ function createExcel(contacts) {
     { header: "Vorname",       key: "vorname",   width: 15 },
     { header: "NacName",      key: "nachname",  width: 20 },
     { header: "Name",          key: "name",      width: 28 },
-    { header: "Firma",         key: "firma",     width: 30 },
-    { header: "Position",      key: "position",  width: 32 },
-    { header: "Email",         key: "email",     width: 32 },
-    { header: "Email 2",       key: "email2",    width: 28 },
-    { header: "Telefon",       key: "telefon",   width: 28 },
-    { header: "Letzte E-Mail", key: "date",      width: 16 },
+    { header: "Firma",          key: "firma",     width: 30 },
+    { header: "Position",       key: "position",  width: 32 },
+    { header: "Email",          key: "email",     width: 32 },
+    { header: "Email 2",        key: "email2",    width: 28 },
+    { header: "Telefon",        key: "telefon",   width: 28 },
+    { header: "Letste E-Mail",  key: "date",      width: 16 },
   ]
 
   ws.getRow(1).eachCell(cell => {
@@ -126,8 +201,41 @@ export async function GET(request) {
 
   try {
     const { mailItems, totalScanned } = await fetchMails(session.accessToken, maxMails)
-    const contacts = buildContacts(mailItems)
-    const wb = createExcel(contacts)
+
+    // Build basic contacts first
+    let contacts = buildContacts(mailItems)
+
+    // Add signature text to each contact for AI processing
+    const sigMap = new Map()
+    for (const item of mailItems) {
+      if (item.body && !sigMap.has(item.email)) {
+        sigMap.set(item.email, extractSignatureLines(item.body))
+      }
+    }
+
+    // Attach signature and prepare for AI
+    contacts = contacts.map(c => ({
+      ...c,
+      _sig: sigMap.get(c.email) || sigMap.get(c.email2) || "",
+    }))
+
+    // Use Claude AI to extract positions
+    contacts = await extractWithAI(contacts)
+
+    // Remove internal fields before Excel
+    const cleanContacts = contacts.map(({ _sig, _key, _email, _freemail, _all, ...rest }) => ({
+      vorname: rest.vorname,
+      nachname: rest.nachname,
+      name: rest.name,
+      firma: rest.firma,
+      position: rest.position,
+      email: rest.email,
+      email2: rest.email2,
+      telefon: rest.telefon,
+      date: rest.date,
+    }))
+
+    const wb = createExcel(cleanContacts)
     const buffer = await wb.xlsx.writeBuffer()
 
     return new Response(buffer, {
@@ -135,7 +243,7 @@ export async function GET(request) {
       headers: {
         "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "Content-Disposition": `attachment; filename="outlook_kontakte.xlsx"`,
-        "X-Contact-Count": String(contacts.length),
+        "X-Contact-Count": String(cleanContacts.length),
         "X-Mail-Count": String(totalScanned),
       },
     })
