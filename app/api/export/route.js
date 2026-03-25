@@ -6,7 +6,7 @@ import ExcelJS from "exceljs"
 export const maxDuration = 60
 
 const GRAPH = "https://graph.microsoft.com/v1.0"
-const ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
+const OPENAI_API = "https://api.openai.com/v1/chat/completions"
 
 async function fetchMails(accessToken, maxMails = 5000) {
   const headers = { Authorization: `Bearer ${accessToken}` }
@@ -79,7 +79,7 @@ function extractSignatureLines(body) {
 async function extractWithAI(contacts) {
   // Only call AI for contacts that have a body/signature
   const needsAI = contacts.filter(c => c._sig && c._sig.length > 20)
-  if (needsAI.length === 0) return contacts
+  if (!needsAI.length || !process.env.OPENAI_API_KEY) return contacts
 
   // Build batch prompt for all contacts at once (max 50 per call)
   const AIBATCH = 50
@@ -95,22 +95,21 @@ Regeln:
 - "firma" = Firmenname (nur wenn klar erkennbar, sonst leer)
 - Falls keine Position erkennbar: leerer String ""
 - Kuerze Positionen auf das Wesentliche
-- Erkenne alle Berufe, nicht nur Fuehrungskraevfte
+- Erkenne alle Berufe, nicht nur Fuehrungskraefte
 
 Signaturen:
 ${batch.map((c, idx) => `[${idx}] Name: ${c.name}\n${c._sig}`).join("\n\n---\n\n")}
 `
 
     try {
-      const res = await fetch(ANTHROPIC_API, {
+      const res = await fetch(OPENAI_API, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-api-key": process.env.ANTHROPIC_API_KEY || "",
-          "anthropic-version": "2023-06-01",
+          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
         },
         body: JSON.stringify({
-          model: "claude-haiku-4-5-20251001",
+          model: "gpt-4o-mini",
           max_tokens: 2000,
           messages: [{ role: "user", content: prompt }],
         }),
@@ -118,7 +117,7 @@ ${batch.map((c, idx) => `[${idx}] Name: ${c.name}\n${c._sig}`).join("\n\n---\n\n
 
       if (!res.ok) continue
       const data = await res.json()
-      const text = data.content?.[0]?.text || ""
+      const text = data.choices?.[0]?.message?.content || ""
       const jsonMatch = text.match(/\[[\s\S]*\]/)
       if (!jsonMatch) continue
 
@@ -144,14 +143,14 @@ function createExcel(contacts) {
 
   ws.columns = [
     { header: "Vorname",       key: "vorname",   width: 15 },
-    { header: "NacName",      key: "nachname",  width: 20 },
+    { header: "Nachname",      key: "nachname",  width: 20 },
     { header: "Name",          key: "name",      width: 28 },
-    { header: "Firma",          key: "firma",     width: 30 },
-    { header: "Position",       key: "position",  width: 32 },
-    { header: "Email",          key: "email",     width: 32 },
-    { header: "Email 2",        key: "email2",    width: 28 },
-    { header: "Telefon",        key: "telefon",   width: 28 },
-    { header: "Letste E-Mail",  key: "date",      width: 16 },
+    { header: "Firma",         key: "firma",     width: 30 },
+    { header: "Position",      key: "position",  width: 32 },
+    { header: "Email",         key: "email",     width: 32 },
+    { header: "Email 2",       key: "email2",    width: 28 },
+    { header: "Telefon",       key: "telefon",   width: 28 },
+    { header: "Letzte E-Mail", key: "date",      width: 16 },
   ]
 
   ws.getRow(1).eachCell(cell => {
@@ -201,10 +200,10 @@ export async function GET(request) {
 
   try {
     const { mailItems, totalScanned } = await fetchMails(session.accessToken, maxMails)
-
+    
     // Build basic contacts first
     let contacts = buildContacts(mailItems)
-
+    
     // Add signature text to each contact for AI processing
     const sigMap = new Map()
     for (const item of mailItems) {
@@ -212,16 +211,16 @@ export async function GET(request) {
         sigMap.set(item.email, extractSignatureLines(item.body))
       }
     }
-
+    
     // Attach signature and prepare for AI
     contacts = contacts.map(c => ({
       ...c,
       _sig: sigMap.get(c.email) || sigMap.get(c.email2) || "",
     }))
-
+    
     // Use Claude AI to extract positions
     contacts = await extractWithAI(contacts)
-
+    
     // Remove internal fields before Excel
     const cleanContacts = contacts.map(({ _sig, _key, _email, _freemail, _all, ...rest }) => ({
       vorname: rest.vorname,
