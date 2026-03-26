@@ -2,6 +2,57 @@
 import { useSession, signIn, signOut } from "next-auth/react"
 import { useState } from "react"
 
+function PasswordGate({ children }) {
+  const [input, setInput] = useState("")
+  const [unlocked, setUnlocked] = useState(false)
+  const [error, setError] = useState(false)
+
+  useEffect(() => {
+    if (sessionStorage.getItem("app_unlocked") === "1") setUnlocked(true)
+  }, [])
+
+  if (unlocked) return children
+
+  return (
+    <PasswordGate>
+    <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#f0f4f8" }}>
+      <div style={{ background: "white", padding: "40px", borderRadius: "12px", boxShadow: "0 4px 24px rgba(0,0,0,0.08)", width: "320px", textAlign: "center" }}>
+        <div style={{ fontSize: "32px", marginBottom: "16px" }}>🔒</div>
+        <h2 style={{ margin: "0 0 8px", color: "#1f4e79", fontSize: "20px" }}>Outlook Kontakte Exporter</h2>
+        <p style={{ color: "#666", fontSize: "14px", margin: "0 0 24px" }}>Passwort eingeben</p>
+        <input
+          type="password"
+          value={input}
+          onChange={e => { setInput(e.target.value); setError(false) }}
+          onKeyDown={e => {
+            if (e.key === "Enter") {
+              if (input === (process.env.NEXT_PUBLIC_APP_PASSWORD || "apex2025")) {
+                sessionStorage.setItem("app_unlocked", "1")
+                setUnlocked(true)
+              } else { setError(true) }
+            }
+          }}
+          placeholder="Passwort"
+          style={{ width: "100%", padding: "10px 14px", borderRadius: "8px", border: error ? "1.5px solid #e53e3e" : "1.5px solid #ccc", fontSize: "15px", boxSizing: "border-box", outline: "none" }}
+          autoFocus
+        />
+        {error && <p style={{ color: "#e53e3e", fontSize: "13px", margin: "8px 0 0" }}>Falsches Passwort</p>}
+        <button
+          onClick={() => {
+            if (input === (process.env.NEXT_PUBLIC_APP_PASSWORD || "apex2025")) {
+              sessionStorage.setItem("app_unlocked", "1")
+              setUnlocked(true)
+            } else { setError(true) }
+          }}
+          style={{ marginTop: "16px", width: "100%", padding: "10px", background: "#1f4e79", color: "white", border: "none", borderRadius: "8px", fontSize: "15px", cursor: "pointer", fontWeight: "600" }}
+        >
+          Einloggen
+        </button>
+      </div>
+    </div>
+  )
+}
+
 export default function Home() {
   const { data: session, status } = useSession()
   const [loading, setLoading] = useState(false)
